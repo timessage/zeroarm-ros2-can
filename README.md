@@ -19,7 +19,7 @@
 
 ### 2. 调整轨迹执行参数（Velocity = 0.3，Accel = 0.3）
 
-![Demo](assets/preview1.png)
+![Demo](assets/output1.png)
 
 
 
