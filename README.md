@@ -8,9 +8,9 @@
 
 ### 1. 默认参数
 
-[![Demo](assets/preview.png)](assets/output.gif)
+![Demo](assets/output.gif)
 
-👉 点击图片查看完整演示
+
 
 **说明：**
 - 使用 RViz 默认轨迹执行参数
@@ -19,9 +19,9 @@
 
 ### 2. 调整轨迹执行参数（Velocity = 0.3，Accel = 0.3）
 
-[![Demo](assets/preview1.png)](assets/output1.gif)
+![Demo](assets/preview1.png)
 
-👉 点击图片查看完整演示
+
 
 **说明：**
 - 将 RViz 中的 `Velocity Scaling` 和 `Accel Scaling` 都调整为 `0.3`
