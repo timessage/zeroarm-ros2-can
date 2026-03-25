@@ -1,0 +1,21 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro" name="zero_arm">
+  <!--
+    A real-hardware URDF wrapper:
+    - includes the visual/collision URDF from zero_arm_description
+    - includes the ros2_control snippet from this bringup package (EmmV5 hardware plugin)
+
+    This lets you keep `moveit_config` generated files intact, while using a different ros2_control backend.
+  -->
+
+  <xacro:arg name="initial_positions_file" default="$(find moveit_config)/config/initial_positions.yaml"/>
+  <xacro:arg name="config_yaml" default="$(find zero_arm_bringup)/config/emm_v5_hw.yaml"/>
+
+  <!-- Import base robot model -->
+  <xacro:include filename="$(find zero_arm_description)/urdf/zero_arm.urdf" />
+
+  <!-- Import real-hardware ros2_control -->
+  <xacro:include filename="$(find zero_arm_bringup)/config/zero_arm_can.ros2_control.xacro" />
+
+  <xacro:zero_arm_ros2_control name="EmmV5System" config_yaml="$(arg config_yaml)" initial_positions_file="$(arg initial_positions_file)"/>
+</robot>

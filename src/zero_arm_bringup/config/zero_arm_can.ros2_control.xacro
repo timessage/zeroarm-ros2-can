@@ -1,0 +1,75 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro">
+  <!--
+    This file is a real-hardware replacement for moveit_config/config/zero_arm.ros2_control.xacro.
+
+    It switches the ros2_control plugin from mock_components/GenericSystem to:
+      emm_v5_hardware/EmmV5System
+
+    You can use it without modifying your auto-generated moveit_config package.
+  -->
+
+  <xacro:macro name="zero_arm_ros2_control" params="name config_yaml initial_positions_file">
+    <xacro:property name="initial_positions" value="${load_yaml(initial_positions_file)['initial_positions']}"/>
+
+    <ros2_control name="${name}" type="system">
+      <hardware>
+        <plugin>emm_v5_hardware/EmmV5System</plugin>
+        <!--
+          The plugin reads this YAML at runtime.
+          Expected schema: see emm_v5_hardware/config/emm_v5_hw.yaml.
+        -->
+        <param name="config_yaml">${config_yaml}</param>
+        <!-- optional defaults (can also be in YAML): -->
+        <param name="can_iface">can0</param>
+        <param name="use_sync_start">true</param>
+        <param name="open_loop">true</param>
+      </hardware>
+
+      <!-- Keep the same joint interfaces as your simulation config -->
+      <joint name="joint1">
+        <command_interface name="position"/>
+        <state_interface name="position">
+          <param name="initial_value">${initial_positions['joint1']}</param>
+        </state_interface>
+        <state_interface name="velocity"/>
+      </joint>
+      <joint name="joint2">
+        <command_interface name="position"/>
+        <state_interface name="position">
+          <param name="initial_value">${initial_positions['joint2']}</param>
+        </state_interface>
+        <state_interface name="velocity"/>
+      </joint>
+      <joint name="joint3">
+        <command_interface name="position"/>
+        <state_interface name="position">
+          <param name="initial_value">${initial_positions['joint3']}</param>
+        </state_interface>
+        <state_interface name="velocity"/>
+      </joint>
+      <joint name="joint4">
+        <command_interface name="position"/>
+        <state_interface name="position">
+          <param name="initial_value">${initial_positions['joint4']}</param>
+        </state_interface>
+        <state_interface name="velocity"/>
+      </joint>
+      <joint name="joint5">
+        <command_interface name="position"/>
+        <state_interface name="position">
+          <param name="initial_value">${initial_positions['joint5']}</param>
+        </state_interface>
+        <state_interface name="velocity"/>
+      </joint>
+      <joint name="joint6">
+        <command_interface name="position"/>
+        <state_interface name="position">
+          <param name="initial_value">${initial_positions['joint6']}</param>
+        </state_interface>
+        <state_interface name="velocity"/>
+      </joint>
+
+    </ros2_control>
+  </xacro:macro>
+</robot>

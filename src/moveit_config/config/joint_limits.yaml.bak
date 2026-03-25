@@ -1,0 +1,40 @@
+# joint_limits.yaml (modified): keep only velocity/acc limits, use URDF for position limits.
+default_velocity_scaling_factor: 0.5
+default_acceleration_scaling_factor: 0.5
+joint_limits:
+  joint1:
+    has_position_limits: false
+    has_velocity_limits: true
+    max_velocity: 2.0
+    has_acceleration_limits: false
+    max_acceleration: 0
+  joint2:
+    has_position_limits: false
+    has_velocity_limits: true
+    max_velocity: 2.0
+    has_acceleration_limits: false
+    max_acceleration: 0
+  joint3:
+    has_position_limits: false
+    has_velocity_limits: true
+    max_velocity: 2.0
+    has_acceleration_limits: false
+    max_acceleration: 0
+  joint4:
+    has_position_limits: false
+    has_velocity_limits: true
+    max_velocity: 2.0
+    has_acceleration_limits: false
+    max_acceleration: 0
+  joint5:
+    has_position_limits: false
+    has_velocity_limits: true
+    max_velocity: 2.0
+    has_acceleration_limits: false
+    max_acceleration: 0
+  joint6:
+    has_position_limits: false
+    has_velocity_limits: true
+    max_velocity: 2.0
+    has_acceleration_limits: false
+    max_acceleration: 0

@@ -1,0 +1,34 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>emm_v5_hardware</name>
+  <version>0.1.0</version>
+  <description>
+    ros2_control SystemInterface plugin for Emm_V5.0 CAN drivers (SocketCAN).
+  </description>
+
+  <maintainer email="you@example.com">your_name</maintainer>
+  <license>BSD-3-Clause</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <build_depend>pluginlib</build_depend>
+  <build_depend>hardware_interface</build_depend>
+  <build_depend>rclcpp</build_depend>
+  <build_depend>rclcpp_lifecycle</build_depend>
+  <build_depend>yaml_cpp_vendor</build_depend>
+
+  <exec_depend>pluginlib</exec_depend>
+  <exec_depend>hardware_interface</exec_depend>
+  <exec_depend>rclcpp</exec_depend>
+  <exec_depend>rclcpp_lifecycle</exec_depend>
+  <exec_depend>yaml_cpp_vendor</exec_depend>
+
+  <depend>emm_v5_driver</depend>
+  <depend>std_srvs</depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+    <pluginlib plugin_manifest="emm_v5_hardware_plugin.xml"/>
+  </export>
+</package>

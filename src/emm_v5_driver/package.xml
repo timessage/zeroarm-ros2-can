@@ -1,0 +1,24 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>emm_v5_driver</name>
+  <version>0.1.0</version>
+  <description>
+    Low-level driver utilities for Emm_V5.0 closed-loop stepper drivers: protocol building + SocketCAN transport.
+    This package is ROS-agnostic and is meant to be reused by hardware plugins and standalone tools.
+  </description>
+
+  <maintainer email="you@example.com">your_name</maintainer>
+  <license>BSD-3-Clause</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <build_depend>rclcpp</build_depend>
+  <exec_depend>rclcpp</exec_depend>
+
+  <!-- Linux SocketCAN headers come from libc/kernel headers; no ROS dependency required -->
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

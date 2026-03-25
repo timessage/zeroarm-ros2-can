@@ -1,0 +1,45 @@
+emm_v5_system:
+  ros__parameters:
+    # SocketCAN interface name: can0 (real) / vcan0 (virtual for offline test)
+    can_iface: "can0"
+
+    # If true, send FD with sync=1 for each joint, then broadcast FF66 to start simultaneously.
+    use_sync_start: false
+    feedback_timeout_s: 0.25
+    cmd_deadband_deg: 0.01
+    min_pulses: 2
+    min_vel_0_1rpm: 250
+
+    # If true, read() mirrors commanded position to state (open-loop).
+    # If false, read() polls 0x36 (motor real position) and updates state from feedback.
+    open_loop: false
+
+    # Joint list (edit these to match your hardware)
+    # Units:
+    # - angles in degrees
+    # - max_vel_deg_s in deg/s
+    # - acc_level: driver’s acceleration level (suggest start with 10)
+    joints:
+      - {name: joint1, addr: 1, motor_steps_per_rev: 200, microsteps: 16, reduction_ratio: 50.0,
+         pos_positive_is_cw: true, sign: +1, min_deg: -180.0, max_deg: 180.0, cyclic: false,
+         max_vel_deg_s: 80.0, acc_level: 5}
+
+      - {name: joint2, addr: 2, motor_steps_per_rev: 200, microsteps: 16, reduction_ratio: 51.0,
+         pos_positive_is_cw: true, sign: +1, min_deg: -5.0, max_deg: 90.0, cyclic: false,
+         max_vel_deg_s: 100.0, acc_level: 10}
+
+      - {name: joint3, addr: 3, motor_steps_per_rev: 200, microsteps: 16, reduction_ratio: 51.0,
+         pos_positive_is_cw: true, sign: +1, min_deg: 0.0, max_deg: 90.0, cyclic: false,
+         max_vel_deg_s: 100.0, acc_level: 10}
+
+      - {name: joint4, addr: 4, motor_steps_per_rev: 200, microsteps: 16, reduction_ratio: 51.0,
+         pos_positive_is_cw: true, sign: +1, min_deg: -90.0, max_deg: 90.0, cyclic: false,
+         max_vel_deg_s: 100.0, acc_level: 5}
+
+      - {name: joint5, addr: 5, motor_steps_per_rev: 200, microsteps: 16, reduction_ratio: 27.0,
+         pos_positive_is_cw: true, sign: +1, min_deg: -5.0, max_deg: 180.0, cyclic: false,
+         max_vel_deg_s: 100.0, acc_level: 5}
+
+      - {name: joint6, addr: 6, motor_steps_per_rev: 200, microsteps: 16, reduction_ratio: 51.0,
+         pos_positive_is_cw: true, sign: +1, min_deg: 0.0, max_deg: 360.0, cyclic: true,
+         max_vel_deg_s: 100.0, acc_level: 5}

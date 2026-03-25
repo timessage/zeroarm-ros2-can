@@ -1,0 +1,11 @@
+<?xml version="1.0"?>
+<library path="emm_v5_hardware">
+  <class
+    name="emm_v5_hardware/EmmV5System"
+    type="emm_v5_hardware::EmmV5System"
+    base_class_type="hardware_interface::SystemInterface">
+    <description>
+      ros2_control SystemInterface for Emm_V5.0 closed-loop stepper drivers over SocketCAN.
+    </description>
+  </class>
+</library>

@@ -1,0 +1,844 @@
+#include "emm_v5_hardware/emm_v5_system.hpp"
+
+#include <cmath>
+#include <stdexcept>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <unordered_map>
+#include <limits>
+
+#include "emm_v5_driver/protocol.hpp"
+
+#ifdef EMM_V5_HAVE_YAML_CPP
+#include <yaml-cpp/yaml.h>
+#endif
+
+#include "pluginlib/class_list_macros.hpp"
+
+
+namespace {
+
+constexpr uint8_t kFuncReadSpeed = 0x35;
+
+struct ReadSpeedResponse {
+  bool negative{false};
+  uint16_t rpm_raw{0};
+  int32_t signed_rpm{0};
+  double motor_rpm{0.0};
+};
+
+std::vector<uint8_t> build_read_speed_payload(uint8_t checksum = emm_v5_driver::kChecksumDefault) {
+  return {checksum};
+}
+
+bool parse_read_speed_response(const uint8_t* data, uint8_t dlc, ReadSpeedResponse* out,
+                               uint8_t checksum = emm_v5_driver::kChecksumDefault) {
+  if (data == nullptr || out == nullptr) return false;
+  if (dlc < 5) return false;
+  if (data[0] != kFuncReadSpeed || data[4] != checksum) return false;
+  const uint8_t sign = data[1];
+  const uint16_t rpm = (static_cast<uint16_t>(data[2]) << 8) |
+                       static_cast<uint16_t>(data[3]);
+  out->negative = (sign == 0x01);
+  out->rpm_raw = rpm;
+  out->signed_rpm = out->negative ? -static_cast<int32_t>(rpm) : static_cast<int32_t>(rpm);
+  out->motor_rpm = static_cast<double>(out->signed_rpm);
+  return true;
+}
+
+struct HoldRuntime {
+  std::vector<double> q_des_deg;
+  std::vector<double> q_ref_deg;
+  std::vector<double> dq_ref_deg_s;
+  std::vector<double> last_sent_deg;
+  std::vector<std::chrono::steady_clock::time_point> last_sent_time;
+  std::vector<std::chrono::steady_clock::time_point> hold_since;
+  std::vector<bool> initialized;
+  std::vector<bool> active;
+};
+
+HoldRuntime& get_hold_runtime(const void* key, size_t n) {
+  static std::unordered_map<const void*, HoldRuntime> runtimes;
+  auto& rt = runtimes[key];
+  if (rt.q_des_deg.size() != n) {
+    rt.q_des_deg.assign(n, 0.0);
+    rt.q_ref_deg.assign(n, 0.0);
+    rt.dq_ref_deg_s.assign(n, 0.0);
+    rt.last_sent_deg.assign(n, std::numeric_limits<double>::quiet_NaN());
+    rt.last_sent_time.assign(n, std::chrono::steady_clock::time_point{});
+    rt.hold_since.assign(n, std::chrono::steady_clock::time_point{});
+    rt.initialized.assign(n, false);
+    rt.active.assign(n, false);
+  }
+  return rt;
+}
+
+constexpr double kServoKpPosToVel = 3.0;      // convert position error to desired velocity
+constexpr double kSendEpsilonDeg = 0.15;      // only resend when reference moved enough
+constexpr double kSendPeriodS = 0.05;         // or periodically refresh hold/trajectory target
+constexpr double kHoldPosToleranceDeg = 0.50; // final-position tolerance for hold
+constexpr double kHoldVelToleranceDegS = 1.50;
+constexpr double kHoldConfirmS = 0.10;        // require remaining in tolerance for this long
+constexpr double kIdleDamping = 0.92;         // decay reference speed near goal
+constexpr double kDefaultMaxAccDegS2 = 220.0; // fallback acceleration if no better estimate exists
+
+}  // namespace
+
+namespace emm_v5_hardware {
+
+EmmV5System::EmmV5System() = default;
+
+EmmV5System::~EmmV5System() {
+  stop_services();
+  can_.close();
+}
+
+hardware_interface::CallbackReturn EmmV5System::on_init(const hardware_interface::HardwareInfo& info) {
+  if (hardware_interface::SystemInterface::on_init(info) != hardware_interface::CallbackReturn::SUCCESS) {
+    return hardware_interface::CallbackReturn::ERROR;
+  }
+
+  if (info_.hardware_parameters.count("can_iface")) {
+    can_iface_ = info_.hardware_parameters.at("can_iface");
+  }
+  if (info_.hardware_parameters.count("use_sync_start")) {
+    use_sync_start_ =
+        (info_.hardware_parameters.at("use_sync_start") == "true" || info_.hardware_parameters.at("use_sync_start") == "1");
+  }
+  if (info_.hardware_parameters.count("open_loop")) {
+    open_loop_ =
+        (info_.hardware_parameters.at("open_loop") == "true" || info_.hardware_parameters.at("open_loop") == "1");
+  }
+  if (info_.hardware_parameters.count("config_yaml")) {
+    config_yaml_ = info_.hardware_parameters.at("config_yaml");
+  }
+  if (info_.hardware_parameters.count("zero_offset_path")) {
+    zero_offset_path_ = info_.hardware_parameters.at("zero_offset_path");
+  } else {
+    const char* home = std::getenv("HOME");
+    std::string base = home ? std::string(home) : std::string("/tmp");
+    zero_offset_path_ = base + "/.ros/emm_v5_zero_offsets.yaml";
+  }
+
+  bool ok = false;
+  if (!config_yaml_.empty()) {
+    ok = load_from_yaml_if_available();
+  }
+  if (!ok) {
+    ok = load_from_hardware_info_params();
+  }
+  if (!ok || joints_.empty()) {
+    RCLCPP_ERROR(logger_, "Failed to load joint configuration. Provide hardware param 'config_yaml' or per-joint params.");
+    return hardware_interface::CallbackReturn::ERROR;
+  }
+
+  const size_t n = joints_.size();
+  hw_states_pos_.assign(n, 0.0);
+  hw_states_vel_.assign(n, 0.0);
+  hw_commands_pos_.assign(n, 0.0);
+  last_pos_deg_.assign(n, 0.0);
+  last_cmd_deg_.assign(n, 0.0);
+  residual_deg_.assign(n, 0.0);
+
+  fb_valid_.assign(n, false);
+  last_pulse_mt_.assign(n, 0);
+  last_fb_time_.assign(n, std::chrono::steady_clock::time_point{});
+
+  (void)get_hold_runtime(this, n);
+
+  ready_for_cmd_ = open_loop_;
+  poll_index_ = 0;
+  last_poll_tick_ = std::chrono::steady_clock::time_point{};
+  poll_per_cycle_ = 6;
+
+  zero_offset_deg_.assign(n, 0.0);
+  (void)load_zero_offsets();
+
+  return hardware_interface::CallbackReturn::SUCCESS;
+}
+
+hardware_interface::CallbackReturn EmmV5System::on_configure(const rclcpp_lifecycle::State&) {
+  try {
+    can_.open(can_iface_);
+  } catch (const std::exception& e) {
+    RCLCPP_ERROR(logger_, "CAN open failed on iface '%s': %s", can_iface_.c_str(), e.what());
+    return hardware_interface::CallbackReturn::ERROR;
+  }
+  start_services();
+  RCLCPP_INFO(logger_, "Configured CAN iface=%s, open_loop=%s, use_sync_start=%s, feedback_timeout=%.3fs",
+              can_iface_.c_str(), open_loop_ ? "true" : "false", use_sync_start_ ? "true" : "false",
+              feedback_timeout_s_);
+  return hardware_interface::CallbackReturn::SUCCESS;
+}
+
+hardware_interface::CallbackReturn EmmV5System::on_activate(const rclcpp_lifecycle::State&) {
+  std::fill(fb_valid_.begin(), fb_valid_.end(), false);
+  ready_for_cmd_ = open_loop_;
+  for (const auto& j : joints_) {
+    const auto payload = emm_v5_driver::build_enable_payload(true, false);
+    (void)can_.send_cmd(j.addr, emm_v5_driver::kFuncEnable, payload);
+  }
+  RCLCPP_INFO(logger_, "EmmV5System activated. open_loop=%s, use_sync_start=%s",
+              open_loop_ ? "true" : "false", use_sync_start_ ? "true" : "false");
+  return hardware_interface::CallbackReturn::SUCCESS;
+}
+
+hardware_interface::CallbackReturn EmmV5System::on_deactivate(const rclcpp_lifecycle::State&) {
+  for (const auto& j : joints_) {
+    const auto payload = emm_v5_driver::build_enable_payload(false, false);
+    (void)can_.send_cmd(j.addr, emm_v5_driver::kFuncEnable, payload);
+  }
+  return hardware_interface::CallbackReturn::SUCCESS;
+}
+
+std::vector<hardware_interface::StateInterface> EmmV5System::export_state_interfaces() {
+  std::vector<hardware_interface::StateInterface> state_interfaces;
+  state_interfaces.reserve(joints_.size() * 2);
+  for (size_t i = 0; i < joints_.size(); ++i) {
+    state_interfaces.emplace_back(joints_[i].name, hardware_interface::HW_IF_POSITION, &hw_states_pos_[i]);
+    state_interfaces.emplace_back(joints_[i].name, hardware_interface::HW_IF_VELOCITY, &hw_states_vel_[i]);
+  }
+  return state_interfaces;
+}
+
+std::vector<hardware_interface::CommandInterface> EmmV5System::export_command_interfaces() {
+  std::vector<hardware_interface::CommandInterface> command_interfaces;
+  command_interfaces.reserve(joints_.size());
+  for (size_t i = 0; i < joints_.size(); ++i) {
+    command_interfaces.emplace_back(joints_[i].name, hardware_interface::HW_IF_POSITION, &hw_commands_pos_[i]);
+  }
+  return command_interfaces;
+}
+
+hardware_interface::return_type EmmV5System::read(const rclcpp::Time&, const rclcpp::Duration& period) {
+  if (open_loop_) {
+    hw_states_pos_ = hw_commands_pos_;
+    std::fill(hw_states_vel_.begin(), hw_states_vel_.end(), 0.0);
+    return hardware_interface::return_type::OK;
+  }
+
+  (void)period;
+
+  // 1) Decode cached replies from real position (0x36) and real speed (0x35)
+  for (size_t i = 0; i < joints_.size(); ++i) {
+    const auto& j = joints_[i];
+    const bool effective_cyclic = j.cyclic && (j.name != "joint1");
+
+    if (!allow_addr0_broadcast_ && j.addr == 0) {
+      continue;
+    }
+
+    // --- real motor position (0x36) ---
+    {
+      emm_v5_driver::CanTransport::RxFrame rx{};
+      if (can_.get_last(j.addr, emm_v5_driver::kFuncReadPos, &rx)) {
+        const bool is_new_sample = (!fb_valid_[i]) || (rx.stamp != last_fb_time_[i]);
+        const double sample_age_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - rx.stamp).count();
+        if (sample_age_s <= feedback_timeout_s_) {
+          emm_v5_driver::ReadPosResponse resp{};
+          if (emm_v5_driver::parse_read_pos_response(rx.data, rx.dlc, &resp)) {
+            const double motor_deg_internal = resp.motor_deg;
+            const double motor_deg_cw = j.pos_positive_is_cw ? motor_deg_internal : -motor_deg_internal;
+            const double joint_deg_cw = motor_deg_cw / std::max(1e-9, j.reduction_ratio);
+            double joint_deg_ros = joint_deg_cw * static_cast<double>(j.sign);
+
+            // apply software zero offsets (ROS-positive degrees)
+            {
+              std::lock_guard<std::mutex> lk(mtx_);
+              if (i < zero_offset_deg_.size()) {
+                joint_deg_ros += zero_offset_deg_[i];
+              }
+            }
+
+            if (effective_cyclic) {
+              joint_deg_ros = normalize_deg_0_360(joint_deg_ros);
+            } else {
+              joint_deg_ros = clamp(joint_deg_ros, j.min_deg, j.max_deg);
+            }
+
+            const double joint_rad = deg2rad(joint_deg_ros);
+
+            if (is_new_sample) {
+              hw_states_pos_[i] = joint_rad;
+              last_pos_deg_[i] = joint_deg_ros;
+              last_fb_time_[i] = rx.stamp;
+              if (!fb_valid_[i]) {
+                fb_valid_[i] = true;
+                hw_states_vel_[i] = 0.0;
+              }
+            }
+
+            if (!ready_for_cmd_) {
+              last_cmd_deg_[i] = joint_deg_ros;
+              residual_deg_[i] = 0.0;
+            }
+          }
+        }
+      }
+    }
+
+    // --- real motor speed (0x35) ---
+    {
+      emm_v5_driver::CanTransport::RxFrame rx{};
+      if (can_.get_last(j.addr, kFuncReadSpeed, &rx)) {
+        const double sample_age_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - rx.stamp).count();
+        if (sample_age_s <= feedback_timeout_s_) {
+          ReadSpeedResponse resp{};
+          if (parse_read_speed_response(rx.data, rx.dlc, &resp)) {
+            const double motor_rpm_internal = resp.motor_rpm;
+            const double motor_rpm_cw = j.pos_positive_is_cw ? motor_rpm_internal : -motor_rpm_internal;
+            const double joint_rpm_cw = motor_rpm_cw / std::max(1e-9, j.reduction_ratio);
+            const double joint_deg_s_ros = joint_rpm_cw * 6.0 * static_cast<double>(j.sign);
+            hw_states_vel_[i] = deg2rad(joint_deg_s_ros);
+          }
+        }
+      }
+    }
+  }
+
+  // 2) Round-robin poll: for each selected joint, request real position (0x36) and real speed (0x35)
+  if (!joints_.empty()) {
+    const size_t K = std::min<size_t>(poll_per_cycle_, joints_.size());
+    for (size_t k = 0; k < K; ++k) {
+      poll_index_ = (poll_index_ + 1) % joints_.size();
+      const auto& pj = joints_[poll_index_];
+      if (allow_addr0_broadcast_ || pj.addr != 0) {
+        (void)can_.send_cmd(pj.addr, emm_v5_driver::kFuncReadPos,
+                            emm_v5_driver::build_read_pos_payload());
+        (void)can_.send_cmd(pj.addr, kFuncReadSpeed,
+                            build_read_speed_payload());
+      }
+    }
+  }
+
+  // gate motion until all joints have at least one position sample
+  if (!ready_for_cmd_) {
+    bool all_ok = true;
+    for (bool v : fb_valid_) all_ok = all_ok && v;
+    if (all_ok) {
+      hw_commands_pos_ = hw_states_pos_;
+      ready_for_cmd_ = true;
+      RCLCPP_INFO(logger_, "Real position feedback synchronized for all joints. Motion commands enabled.");
+    }
+  }
+
+  const auto now = std::chrono::steady_clock::now();
+  for (size_t i = 0; i < joints_.size(); ++i) {
+    if (!fb_valid_[i]) {
+      continue;
+    }
+    const double age_s = std::chrono::duration<double>(now - last_fb_time_[i]).count();
+    if (age_s > feedback_timeout_s_) {
+      RCLCPP_WARN_THROTTLE(logger_, steady_clock_, 2000,
+                           "Stale real-position feedback on %s: age=%.3fs", joints_[i].name.c_str(), age_s);
+    }
+  }
+
+  return hardware_interface::return_type::OK;
+}
+
+
+hardware_interface::return_type EmmV5System::write(const rclcpp::Time&, const rclcpp::Duration& period) {
+  const double dt = std::max(1e-3, period.seconds());
+
+  if (!open_loop_ && !ready_for_cmd_) {
+    return hardware_interface::return_type::OK;
+  }
+
+  auto& rt = get_hold_runtime(this, joints_.size());
+  const auto now = std::chrono::steady_clock::now();
+
+  for (size_t i = 0; i < joints_.size(); ++i) {
+    const auto& j = joints_[i];
+    const bool effective_cyclic = j.cyclic && (j.name != "joint1");
+    if (!allow_addr0_broadcast_ && j.addr == 0) {
+      continue;
+    }
+
+    double requested_deg_ros = rad2deg(hw_commands_pos_[i]);
+    if (effective_cyclic) {
+      requested_deg_ros = normalize_deg_0_360(requested_deg_ros);
+    } else {
+      requested_deg_ros = clamp(requested_deg_ros, j.min_deg, j.max_deg);
+    }
+
+    const double q_meas_deg = fb_valid_[i] ? last_pos_deg_[i] : last_cmd_deg_[i];
+    const double dq_meas_deg_s = rad2deg(hw_states_vel_[i]);
+
+    if (!rt.initialized[i]) {
+      rt.q_des_deg[i] = requested_deg_ros;
+      rt.q_ref_deg[i] = q_meas_deg;
+      rt.dq_ref_deg_s[i] = 0.0;
+      rt.initialized[i] = true;
+      rt.active[i] = false;
+      rt.hold_since[i] = std::chrono::steady_clock::time_point{};
+      rt.last_sent_deg[i] = std::numeric_limits<double>::quiet_NaN();
+      last_cmd_deg_[i] = q_meas_deg;
+    }
+
+    rt.q_des_deg[i] = requested_deg_ros;
+
+    const double err_to_goal_deg = effective_cyclic ? shortest_diff_deg(q_meas_deg, rt.q_des_deg[i])
+                                                    : (rt.q_des_deg[i] - q_meas_deg);
+    const bool in_pos_tol = std::abs(err_to_goal_deg) <= kHoldPosToleranceDeg;
+    const bool in_vel_tol = std::abs(dq_meas_deg_s) <= kHoldVelToleranceDegS;
+
+    if (in_pos_tol && in_vel_tol) {
+      if (rt.hold_since[i] == std::chrono::steady_clock::time_point{}) {
+        rt.hold_since[i] = now;
+      }
+    } else {
+      rt.hold_since[i] = std::chrono::steady_clock::time_point{};
+    }
+
+    const bool hold_confirmed = (rt.hold_since[i] != std::chrono::steady_clock::time_point{}) &&
+        (std::chrono::duration<double>(now - rt.hold_since[i]).count() >= kHoldConfirmS);
+
+    if (hold_confirmed) {
+      rt.q_ref_deg[i] = rt.q_des_deg[i];
+      rt.dq_ref_deg_s[i] = 0.0;
+      rt.active[i] = false;
+    } else {
+      rt.active[i] = true;
+
+      double err_ref_deg = effective_cyclic ? shortest_diff_deg(rt.q_ref_deg[i], rt.q_des_deg[i])
+                                            : (rt.q_des_deg[i] - rt.q_ref_deg[i]);
+
+      const double v_max_deg_s = std::max(1.0, j.max_vel_deg_s);
+      const double a_max_deg_s2 = std::max(30.0, kDefaultMaxAccDegS2);
+
+      double v_des_deg_s = EmmV5System::clamp(kServoKpPosToVel * err_ref_deg, -v_max_deg_s, v_max_deg_s);
+
+      const double braking_v_deg_s = std::sqrt(std::max(0.0, 2.0 * a_max_deg_s2 * std::abs(err_ref_deg)));
+      v_des_deg_s = std::copysign(std::min(std::abs(v_des_deg_s), braking_v_deg_s), err_ref_deg);
+
+      double dv_deg_s = v_des_deg_s - rt.dq_ref_deg_s[i];
+      const double max_dv_deg_s = a_max_deg_s2 * dt;
+      dv_deg_s = EmmV5System::clamp(dv_deg_s, -max_dv_deg_s, max_dv_deg_s);
+      rt.dq_ref_deg_s[i] += dv_deg_s;
+
+      if (std::abs(err_ref_deg) < 0.5) {
+        rt.dq_ref_deg_s[i] *= kIdleDamping;
+      }
+
+      double q_next_deg = rt.q_ref_deg[i] + rt.dq_ref_deg_s[i] * dt;
+      const double err_after_deg = effective_cyclic ? shortest_diff_deg(q_next_deg, rt.q_des_deg[i])
+                                                    : (rt.q_des_deg[i] - q_next_deg);
+      if (std::copysign(1.0, err_after_deg) != std::copysign(1.0, err_ref_deg) || std::abs(err_after_deg) < kHoldPosToleranceDeg) {
+        q_next_deg = rt.q_des_deg[i];
+        rt.dq_ref_deg_s[i] = 0.0;
+      }
+
+      if (effective_cyclic) {
+        rt.q_ref_deg[i] = normalize_deg_0_360(q_next_deg);
+      } else {
+        rt.q_ref_deg[i] = clamp(q_next_deg, j.min_deg, j.max_deg);
+      }
+    }
+
+    const bool never_sent = !std::isfinite(rt.last_sent_deg[i]);
+    const double delta_to_last_sent_deg = never_sent
+        ? std::numeric_limits<double>::infinity()
+        : (effective_cyclic ? shortest_diff_deg(rt.last_sent_deg[i], rt.q_ref_deg[i])
+                            : (rt.q_ref_deg[i] - rt.last_sent_deg[i]));
+    const double since_last_send_s = std::chrono::duration<double>(now - rt.last_sent_time[i]).count();
+
+    if (!never_sent && std::abs(delta_to_last_sent_deg) < kSendEpsilonDeg && since_last_send_s < kSendPeriodS) {
+      continue;
+    }
+
+    uint16_t vel_0_1rpm = vel_deg_s_to_0_1rpm(j, std::max(std::abs(rt.dq_ref_deg_s[i]), 2.0));
+    vel_0_1rpm = std::max(min_vel_0_1rpm_, vel_0_1rpm);
+
+    std::vector<uint8_t> payload;
+    if (effective_cyclic) {
+      const double delta_deg = shortest_diff_deg(q_meas_deg, rt.q_ref_deg[i]);
+      const uint32_t pulses = deg_to_pulses(j, std::abs(delta_deg));
+      if (pulses < min_pulses_) {
+        continue;
+      }
+      const uint8_t dir_bit = dir_bit_for_delta(j, delta_deg);
+      payload = emm_v5_driver::build_pos_fd_payload(
+          dir_bit, vel_0_1rpm, j.acc_level, pulses, false /*relative*/, use_sync_start_);
+    } else {
+      double zero_offset_deg = 0.0;
+      {
+        std::lock_guard<std::mutex> lk(mtx_);
+        if (i < zero_offset_deg_.size()) {
+          zero_offset_deg = zero_offset_deg_[i];
+        }
+      }
+      const double target_deg_ros_raw = rt.q_ref_deg[i] - zero_offset_deg;
+      const double sign_scalar = static_cast<double>(j.sign == 0 ? 1 : j.sign);
+      const double joint_deg_cw = target_deg_ros_raw / sign_scalar;
+      const uint8_t dir_bit = (joint_deg_cw >= 0.0) ? 0x00 : 0x01;
+      const uint32_t pulses = deg_to_pulses(j, std::abs(target_deg_ros_raw));
+      if (pulses < min_pulses_) {
+        continue;
+      }
+      payload = emm_v5_driver::build_pos_fd_payload(
+          dir_bit, vel_0_1rpm, j.acc_level, pulses, true /*absolute*/, use_sync_start_);
+    }
+
+    if (!can_.send_cmd(j.addr, emm_v5_driver::kFuncPosMode, payload)) {
+      RCLCPP_WARN_THROTTLE(logger_, steady_clock_, 2000,
+                           "Failed to send continuous interpolated position command to %s(addr=%u)",
+                           j.name.c_str(), j.addr);
+      continue;
+    }
+
+    rt.last_sent_deg[i] = rt.q_ref_deg[i];
+    rt.last_sent_time[i] = now;
+    last_cmd_deg_[i] = rt.q_ref_deg[i];
+    residual_deg_[i] = 0.0;
+    if (open_loop_) {
+      last_pos_deg_[i] = last_cmd_deg_[i];
+    }
+  }
+
+  if (use_sync_start_) {
+    const auto payload = emm_v5_driver::build_sync_start_payload();
+    if (!can_.send_cmd(0 /*broadcast*/, emm_v5_driver::kFuncSync, payload)) {
+      RCLCPP_WARN_THROTTLE(logger_, steady_clock_, 2000,
+                           "Failed to send sync-start broadcast.");
+    }
+  }
+
+  return hardware_interface::return_type::OK;
+}
+
+// ===== config loading =====
+// NOTE: Keep your existing load_from_yaml_if_available()/load_from_hardware_info_params()
+// from your repository. If you already have them, keep them; this file assumes they exist.
+
+bool EmmV5System::load_from_yaml_if_available() {
+#ifndef EMM_V5_HAVE_YAML_CPP
+  RCLCPP_WARN(logger_, "yaml-cpp not found at build time; cannot parse config_yaml. Falling back to per-joint ros2_control params.");
+  return false;
+#else
+  try {
+    YAML::Node root = YAML::LoadFile(config_yaml_);
+    YAML::Node params = root["emm_v5_system"]["ros__parameters"];
+    if (!params) params = root;
+
+    if (params["can_iface"]) can_iface_ = params["can_iface"].as<std::string>();
+    if (params["use_sync_start"]) use_sync_start_ = params["use_sync_start"].as<bool>();
+    if (params["open_loop"]) open_loop_ = params["open_loop"].as<bool>();
+    if (params["poll_one_joint_hz"]) poll_one_joint_hz_ = params["poll_one_joint_hz"].as<double>();
+    if (params["feedback_timeout_s"]) feedback_timeout_s_ = params["feedback_timeout_s"].as<double>();
+    if (params["cmd_deadband_deg"]) cmd_deadband_deg_ = params["cmd_deadband_deg"].as<double>();
+    if (params["min_pulses"]) min_pulses_ = static_cast<uint32_t>(params["min_pulses"].as<int>());
+    if (params["min_vel_0_1rpm"]) min_vel_0_1rpm_ = static_cast<uint16_t>(params["min_vel_0_1rpm"].as<int>());
+    if (params["allow_addr0_broadcast"]) allow_addr0_broadcast_ = params["allow_addr0_broadcast"].as<bool>();
+    if (params["poll_per_cycle"]) poll_per_cycle_ = static_cast<size_t>(std::max(1, params["poll_per_cycle"].as<int>()));
+
+    YAML::Node joints = params["joints"];
+    if (!joints || !joints.IsSequence()) {
+      RCLCPP_ERROR(logger_, "config_yaml missing 'joints' list.");
+      return false;
+    }
+
+    joints_.clear();
+    for (const auto& jn : joints) {
+      JointCfg j;
+      j.name = jn["name"].as<std::string>();
+      j.addr = static_cast<uint8_t>(jn["addr"].as<int>());
+      if (jn["motor_steps_per_rev"]) j.motor_steps_per_rev = jn["motor_steps_per_rev"].as<int>();
+      if (jn["microsteps"]) j.microsteps = jn["microsteps"].as<int>();
+      if (jn["reduction_ratio"]) j.reduction_ratio = jn["reduction_ratio"].as<double>();
+      if (jn["pos_positive_is_cw"]) j.pos_positive_is_cw = jn["pos_positive_is_cw"].as<bool>();
+      if (jn["sign"]) j.sign = jn["sign"].as<int>();
+      if (jn["min_deg"]) j.min_deg = jn["min_deg"].as<double>();
+      if (jn["max_deg"]) j.max_deg = jn["max_deg"].as<double>();
+      if (jn["cyclic"]) j.cyclic = jn["cyclic"].as<bool>();
+      if (jn["max_vel_deg_s"]) j.max_vel_deg_s = jn["max_vel_deg_s"].as<double>();
+      if (jn["acc_level"]) j.acc_level = static_cast<uint8_t>(jn["acc_level"].as<int>());
+      joints_.push_back(j);
+    }
+
+    last_pos_deg_.assign(joints_.size(), 0.0);
+    RCLCPP_INFO(logger_, "Loaded %zu joints from YAML: %s (poll_per_cycle=%zu)",
+                joints_.size(), config_yaml_.c_str(), poll_per_cycle_);
+    return true;
+  } catch (const std::exception& e) {
+    RCLCPP_ERROR(logger_, "Failed to parse config_yaml '%s': %s", config_yaml_.c_str(), e.what());
+    return false;
+  }
+#endif
+}
+
+bool EmmV5System::load_from_hardware_info_params() {
+  joints_.clear();
+  bool bad_addr0 = false;
+
+  if (info_.joints.empty()) return false;
+
+  for (const auto& ji : info_.joints) {
+    JointCfg j;
+    j.name = ji.name;
+
+    auto get_s = [&](const std::string& key, const std::string& def) -> std::string {
+      auto it = ji.parameters.find(key);
+      return it == ji.parameters.end() ? def : it->second;
+    };
+
+    j.addr = static_cast<uint8_t>(std::stoi(get_s("addr", "0")));
+    j.motor_steps_per_rev = std::stoi(get_s("motor_steps_per_rev", "200"));
+    j.microsteps = std::stoi(get_s("microsteps", "16"));
+    j.reduction_ratio = std::stod(get_s("reduction_ratio", "1.0"));
+    j.pos_positive_is_cw = (get_s("pos_positive_is_cw", "true") == "true" || get_s("pos_positive_is_cw", "1") == "1");
+    j.sign = std::stoi(get_s("sign", "+1"));
+    j.min_deg = std::stod(get_s("min_deg", "0.0"));
+    j.max_deg = std::stod(get_s("max_deg", "360.0"));
+    j.cyclic = (get_s("cyclic", "false") == "true" || get_s("cyclic", "1") == "1");
+    j.max_vel_deg_s = std::stod(get_s("max_vel_deg_s", "20.0"));
+    j.acc_level = static_cast<uint8_t>(std::stoi(get_s("acc_level", "10")));
+
+    if (j.addr == 0) {
+      bad_addr0 = true;
+      RCLCPP_ERROR(logger_, "Joint '%s' missing 'addr' parameter (addr=0). This would broadcast on CAN.",
+                   j.name.c_str());
+    }
+
+    joints_.push_back(j);
+  }
+
+  if (bad_addr0 && !allow_addr0_broadcast_) {
+    return false;
+  }
+
+  last_pos_deg_.assign(joints_.size(), 0.0);
+  RCLCPP_INFO(logger_, "Loaded %zu joints from ros2_control per-joint parameters.", joints_.size());
+  return true;
+}
+
+// ===== helpers =====
+double EmmV5System::rad2deg(double rad) { return rad * 180.0 / M_PI; }
+double EmmV5System::deg2rad(double deg) { return deg * M_PI / 180.0; }
+
+double EmmV5System::normalize_deg_0_360(double deg) {
+  double d = std::fmod(deg, 360.0);
+  if (d < 0) d += 360.0;
+  return d;
+}
+
+double EmmV5System::shortest_diff_deg(double cur_deg, double tgt_deg) {
+  double diff = tgt_deg - cur_deg;
+  while (diff > 180.0) diff -= 360.0;
+  while (diff <= -180.0) diff += 360.0;
+  return diff;
+}
+
+double EmmV5System::clamp(double v, double lo, double hi) {
+  return std::min(std::max(v, lo), hi);
+}
+
+uint32_t EmmV5System::deg_to_pulses(const JointCfg& j, double deg_abs) const {
+  const double pulses_per_joint_rev =
+      static_cast<double>(j.motor_steps_per_rev) * static_cast<double>(j.microsteps) * j.reduction_ratio;
+  const double pulses = (deg_abs / 360.0) * pulses_per_joint_rev;
+  const double clipped = std::min(std::max(pulses, 0.0), static_cast<double>(0xFFFFFFFFu));
+  return static_cast<uint32_t>(std::llround(clipped));
+}
+
+uint16_t EmmV5System::vel_deg_s_to_0_1rpm(const JointCfg& j, double vel_deg_s) const {
+  const double joint_rpm = vel_deg_s / 6.0;
+  const double motor_rpm = joint_rpm * j.reduction_ratio;
+  const double v_0_1rpm = motor_rpm * 10.0;
+  const double clipped = std::min(std::max(v_0_1rpm, 0.0), static_cast<double>(0xFFFF));
+  return static_cast<uint16_t>(std::llround(clipped));
+}
+
+uint8_t EmmV5System::dir_bit_for_delta(const JointCfg& j, double delta_deg_ros) const {
+  const double delta_hw = static_cast<double>(j.sign) * delta_deg_ros;
+  const bool cw = (delta_hw >= 0.0) ? j.pos_positive_is_cw : (!j.pos_positive_is_cw);
+  return cw ? 0x00 : 0x01;
+}
+
+// ===== zero offset persistence =====
+bool EmmV5System::save_zero_offsets() const {
+  try {
+    namespace fs = std::filesystem;
+    fs::path p(zero_offset_path_);
+    fs::create_directories(p.parent_path());
+
+#ifdef EMM_V5_HAVE_YAML_CPP
+    YAML::Node root;
+    YAML::Node jo;
+    for (size_t i = 0; i < joints_.size(); ++i) {
+      jo[joints_[i].name] = zero_offset_deg_[i];
+    }
+    root["zero_offsets_deg"] = jo;
+
+    std::ofstream fout(zero_offset_path_, std::ios::out | std::ios::trunc);
+    fout << root;
+    fout.close();
+#else
+    std::ofstream fout(zero_offset_path_, std::ios::out | std::ios::trunc);
+    fout << "zero_offsets_deg:\n";
+    for (size_t i = 0; i < joints_.size(); ++i) {
+      fout << "  " << joints_[i].name << ": " << zero_offset_deg_[i] << "\n";
+    }
+    fout.close();
+#endif
+    return true;
+  } catch (const std::exception& e) {
+    RCLCPP_ERROR(logger_, "Failed to save zero offsets: %s", e.what());
+    return false;
+  }
+}
+
+bool EmmV5System::load_zero_offsets() {
+  try {
+    namespace fs = std::filesystem;
+    if (!fs::exists(zero_offset_path_)) {
+      RCLCPP_INFO(logger_, "Zero offset file not found, start with zeros: %s", zero_offset_path_.c_str());
+      return false;
+    }
+
+#ifdef EMM_V5_HAVE_YAML_CPP
+    YAML::Node root = YAML::LoadFile(zero_offset_path_);
+    YAML::Node jo = root["zero_offsets_deg"];
+    if (!jo || !jo.IsMap()) {
+      RCLCPP_WARN(logger_, "Invalid zero offset yaml (missing zero_offsets_deg map).");
+      return false;
+    }
+    for (size_t i = 0; i < joints_.size(); ++i) {
+      const auto& name = joints_[i].name;
+      if (jo[name]) {
+        zero_offset_deg_[i] = jo[name].as<double>();
+      }
+    }
+#else
+    std::ifstream fin(zero_offset_path_);
+    std::string line;
+    auto trim = [](std::string s) {
+      size_t b = s.find_first_not_of(" \t");
+      size_t e = s.find_last_not_of(" \t\r\n");
+      if (b == std::string::npos) return std::string();
+      return s.substr(b, e - b + 1);
+    };
+    while (std::getline(fin, line)) {
+      auto pos = line.find(':');
+      if (pos == std::string::npos) continue;
+      std::string key = trim(line.substr(0, pos));
+      std::string val = trim(line.substr(pos + 1));
+      if (key == "zero_offsets_deg") continue;
+      for (size_t i = 0; i < joints_.size(); ++i) {
+        if (key == joints_[i].name) {
+          zero_offset_deg_[i] = std::stod(val);
+        }
+      }
+    }
+#endif
+
+    RCLCPP_INFO(logger_, "Loaded zero offsets from: %s", zero_offset_path_.c_str());
+    return true;
+  } catch (const std::exception& e) {
+    RCLCPP_ERROR(logger_, "Failed to load zero offsets: %s", e.what());
+    return false;
+  }
+}
+
+// ===== services =====
+void EmmV5System::start_services() {
+  if (srv_node_) return;
+
+  srv_ctx_ = std::make_shared<rclcpp::Context>();
+  srv_ctx_->init(0, nullptr);
+
+  rclcpp::NodeOptions opts;
+  opts.context(srv_ctx_);
+  srv_node_ = std::make_shared<rclcpp::Node>("emm_v5_hw_srv", opts);
+
+  rclcpp::ExecutorOptions eopts;
+  eopts.context = srv_ctx_;
+  srv_exec_ = std::make_shared<rclcpp::executors::SingleThreadedExecutor>(eopts);
+  srv_exec_->add_node(srv_node_);
+
+  // /emm_v5/set_zero : only joint1
+  srv_set_zero_joint1_ = srv_node_->create_service<std_srvs::srv::Trigger>(
+      "/emm_v5/set_zero",
+      [this](const std::shared_ptr<std_srvs::srv::Trigger::Request>&,
+             std::shared_ptr<std_srvs::srv::Trigger::Response> resp) {
+        std::lock_guard<std::mutex> lk(mtx_);
+
+        if (!open_loop_) {
+          bool all_ok = true;
+          for (bool v : fb_valid_) all_ok = all_ok && v;
+          if (!all_ok) {
+            resp->success = false;
+            resp->message = "Feedback not valid for all joints yet. Wait and retry.";
+            return;
+          }
+        }
+
+        size_t idx = joints_.size();
+        for (size_t i = 0; i < joints_.size(); ++i) {
+          if (joints_[i].name == "joint1") { idx = i; break; }
+        }
+        if (idx == joints_.size()) {
+          resp->success = false;
+          resp->message = "joint1 not found.";
+          return;
+        }
+
+        const double cur_deg = rad2deg(hw_states_pos_[idx]);
+        zero_offset_deg_[idx] = -cur_deg;
+
+        // align caches for joint1 to avoid sudden jump
+        last_cmd_deg_[idx] = 0.0;
+        residual_deg_[idx] = 0.0;
+        last_pos_deg_[idx] = 0.0;
+        hw_commands_pos_[idx] = 0.0;
+
+        const bool ok = save_zero_offsets();
+        resp->success = ok;
+        resp->message = ok ? "joint1 zero offset saved." : "joint1 zero set, but failed to save file.";
+      });
+
+  // /emm_v5/clear_zero : clear all offsets
+  srv_clear_zero_ = srv_node_->create_service<std_srvs::srv::Trigger>(
+      "/emm_v5/clear_zero",
+      [this](const std::shared_ptr<std_srvs::srv::Trigger::Request>&,
+             std::shared_ptr<std_srvs::srv::Trigger::Response> resp) {
+        std::lock_guard<std::mutex> lk(mtx_);
+        for (auto &v : zero_offset_deg_) v = 0.0;
+        const bool ok = save_zero_offsets();
+        resp->success = ok;
+        resp->message = ok ? "All zero offsets cleared and saved." : "Cleared offsets, but failed to save file.";
+      });
+
+  srv_thread_ = std::thread([this]() {
+    while (srv_ctx_ && srv_ctx_->is_valid() && rclcpp::ok(srv_ctx_)) {
+      srv_exec_->spin_some();
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+  });
+
+  RCLCPP_INFO(logger_, "Services started: /emm_v5/set_zero (joint1), /emm_v5/clear_zero. Save: %s",
+              zero_offset_path_.c_str());
+}
+
+void EmmV5System::stop_services() {
+  if (!srv_ctx_) return;
+
+  try { srv_ctx_->shutdown("emm_v5_hw_srv shutdown"); } catch (...) {}
+
+  if (srv_thread_.joinable()) srv_thread_.join();
+
+  if (srv_exec_ && srv_node_) {
+    try { srv_exec_->remove_node(srv_node_); } catch (...) {}
+  }
+
+  srv_set_zero_joint1_.reset();
+  srv_clear_zero_.reset();
+  srv_exec_.reset();
+  srv_node_.reset();
+  srv_ctx_.reset();
+}
+
+}  // namespace emm_v5_hardware
+
+PLUGINLIB_EXPORT_CLASS(emm_v5_hardware::EmmV5System, hardware_interface::SystemInterface)
