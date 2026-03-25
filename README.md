@@ -8,7 +8,7 @@
 
 ### 1. 默认参数
 
-[![Demo](assets/preview.gif)](assets/output.gif)
+[![Demo](assets/preview.png)](assets/output.gif)
 
 👉 点击图片查看完整演示
 
@@ -19,7 +19,7 @@
 
 ### 2. 调整轨迹执行参数（Velocity = 0.3，Accel = 0.3）
 
-[![Demo](assets/preview1.gif)](assets/output1.gif)
+[![Demo](assets/preview1.png)](assets/output1.gif)
 
 👉 点击图片查看完整演示
 
