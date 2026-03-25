@@ -1,8 +1,12 @@
 # zeroarm-ros2-can
 
- 一个基于 **ROS2 + MoveIt2 + ros2_control + CAN 总线** 的机械臂真实控制项目。
+> 一个基于 **ROS2 + MoveIt2 + ros2_control + CAN 总线** 的机械臂真实控制项目。
 
-<video src="assets/demo.mp4" controls width="600"></video>
+## Demo
+
+[![Demo](assets/preview.png)](assets/demo.mp4)
+
+👉 点击图片查看完整演示视频
 
 
 
@@ -12,9 +16,9 @@
 
 本项目面向自研 ZeroArm 机械臂，完成了从上层运动规划到底层真实硬件执行的完整控制链路，主要包括：
 
-- 使用 MoveIt2进行运动规划
-- 使用 ros2_control进行控制器与硬件接口管理
-- 使用自定义 CAN 驱动层与 EMM V5 电机驱动器通信
+- 使用 **MoveIt2** 进行运动规划
+- 使用 **ros2_control** 进行控制器与硬件接口管理
+- 使用自定义 **CAN 驱动层** 与 EMM V5 电机驱动器通信
 - 支持真实关节位置 / 速度反馈读取
 - 支持零点标定与参数化配置
 - 支持对底层 `FD` 位置模式命令进行优化，减少重复发送带来的速度建立问题
@@ -209,8 +213,6 @@ ros2 launch zero_arm_bringup real_can_moveit.launch.py
 - 增加更多演示任务与示例
 - 进一步完善轨迹优化 / MPC 风格控制器
 - 继续进行硬件参数整定与运动性能优化
-
----
 
 
 
